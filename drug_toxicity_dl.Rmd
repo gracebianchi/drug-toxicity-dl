@@ -178,3 +178,80 @@ class_weights
 
 Molecular fingerprints are binary vectors (0/1) where each bit indicates presence or absence of a molecular substructure. Since all features are already on the same scale by construction, normalization is not required and would risk distorting the sparse structure of the fingerprint representation.
 
+## Converting to Tensors
+
+Before building the model, the fingerprint features and toxicity labels are converted from data frames into torch tensors, the data structure the model operates on. Features are stored as a compounds x 2048 matrix and labels as a compounds x 12 matrix, with missing labels preserved as `NaN` so they can be masked during loss computation.
+
+```{r}
+# Extracting fingerprint and label matrices
+fp_train <- tox_train %>%
+  select(starts_with("fp")) %>%
+  as.matrix()
+
+fp_test <- tox_test %>%
+  select(starts_with("fp")) %>%
+  as.matrix()
+
+lab_train <- tox_train %>%
+  select(all_of(endpoint_cols)) %>%
+  as.matrix()
+
+lab_test <- tox_test %>%
+  select(all_of(endpoint_cols)) %>%
+  as.matrix()
+```
+
+```{r}
+# Convert to Torch Tensors
+fp_train_t <- torch_tensor(fp_train, dtype = torch_float())
+
+fp_test_t <- torch_tensor(fp_test, dtype = torch_float())
+
+lab_train_t <- torch_tensor(lab_train, dtype = torch_float())
+
+lab_test_t <- torch_tensor(lab_test, dtype = torch_float())
+
+fp_train_t$shape
+lab_train_t$shape
+```
+
+## Building Dataset and Dataloader
+
+```{r}
+tox_dataset <- dataset(
+  name = "tox_dataset",
+  
+  initialize = function(features, labels) {
+    self$features <- features
+    self$labels <- labels
+  },
+  
+  .getitem = function(i) {
+    list(
+      x = self$features[i,],
+      y = self$labels[i,]
+    )
+  },
+  
+  .length = function() {
+    self$features$shape[1]
+  }
+)
+```
+
+```{r}
+# instantiate for training and testing
+train_ds <- tox_dataset(fp_train_t, lab_train_t)
+test_ds <- tox_dataset(fp_test_t, lab_test_t)
+
+# wrap in dataloaders
+train_dl <- dataloader(train_ds, batch_size = 64, shuffle = TRUE)
+test_dl <- dataloader(test_ds, batch_size = 64, shuffle = FALSE)
+```
+
+```{r}
+batch <- train_dl$.iter()$.next()
+batch$x$shape
+batch$y$shape
+```
+
