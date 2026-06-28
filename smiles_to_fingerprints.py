@@ -4,7 +4,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 # Load data
-df = pd.read_csv('data/tox21.csv')
+df = pd.read_csv('data/raw/tox21.csv')
 print(f"Loaded {len(df)} compounds")
 
 # Convert a single SMILES string to a Morgan fingerprint (bit vector)

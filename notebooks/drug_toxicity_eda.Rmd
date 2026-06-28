@@ -1,0 +1,143 @@
+---
+title: "Drug Toxicity Exploratory Data Analysis"
+author: "Grace Bianchi"
+date: "June 2026"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+---
+
+# Exploratory Data Analysis
+
+## Loading and Tidying Data
+
+We begin by loading the packages needed for data manipulation, modeling, and visualization. 
+
+```{r, message = F, warning = F}
+# Loading Libraries
+library(tidyverse)
+library(tidymodels)
+library(naniar)
+library(torch)
+library(pROC)
+library(factoextra)
+library(FactoMineR)
+```
+
+SMILES strings were converted to 2,048-bit Morgan molecular fingerprints using RDKit in Python and saved as a CSV, which is loaded here alongside the original compound data and toxicity labels.
+
+```{r, warning = F}
+# Converted smiles to fingerprints in python, loading that csv here
+tox21_w_fps <- read.csv("data/raw/tox21_with_fingerprints.csv")
+```
+
+## Cleaning and Preprocessing
+
+The dataset contains 7,823 compounds across 2,062 columns: 12 toxicity endpoint labels, the original SMILES string, and 2,048 binary fingerprint features. The original Tox21 training set contains 8,014 compounds. Following SMILES parsing in Python, 191 compounds were dropped due to invalid or unparseable SMILES strings, resulting in a final dataset of 7,823 compounds. Missing values are present across all 12 endpoints (7–26%), reflecting compounds that were not tested in every assay rather than confirmed non-toxic outcomes. Missing labels will be masked during model training rather than imputed to avoid introducing false negatives into the training signal.
+
+```{r, warning = F}
+dim(tox21_w_fps)
+
+endpoints <- tox21_w_fps %>%
+  select("SR.MMP", "NR.Aromatase", "SR.ARE", "NR.ER",
+         "NR.PPAR.gamma", "SR.HSE", "NR.AhR", "NR.AR.LBD", 
+         "SR.p53", "NR.ER.LBD", "SR.ATAD5", "NR.AR")
+
+
+summary(endpoints)
+
+miss_var_summary(endpoints)
+
+gg_miss_var(endpoints)
+```
+
+## Visual EDA
+
+### Toxicity Rate by Endpoint
+
+```{r, warning = F}
+endpoint_cols <- c("NR.AR", "NR.AR.LBD", "NR.AhR", "NR.Aromatase", 
+                    "NR.ER", "NR.ER.LBD", "NR.PPAR.gamma", 
+                    "SR.ARE", "SR.ATAD5", "SR.HSE", "SR.MMP", "SR.p53")
+
+long_data <- tox21_w_fps %>%
+  select(all_of(endpoint_cols)) %>%
+  pivot_longer(everything(), names_to = "endpoint", values_to = "label") %>%
+  filter(!is.na(label)) %>%
+  mutate(label = factor(label, levels = c(0, 1), labels = c("Non-toxic", "Toxic")))
+
+toxic_pct <- long_data %>%
+  group_by(endpoint) %>%
+  summarise(pct_toxic = mean(label == "Toxic") * 100)
+
+ggplot(toxic_pct, aes(x = reorder(endpoint, pct_toxic), y = pct_toxic)) +
+  geom_col(fill = "lightblue") +
+  coord_flip() +
+  labs(title = "Toxicity Rate by Endpoint",
+       x = NULL, y = "% Toxic") +
+  theme_minimal()
+```
+
+Toxicity rates vary substantially across endpoints, with stress response assays SR.ARE and SR.MMP showing the highest active rates (~16%), followed by nuclear receptor endpoints NR.ER and NR.AhR (~12–13%). The remaining eight endpoints fall below 7%, with NR.PPAR.gamma showing the lowest toxicity rate overall. This imbalance is consistent across all endpoints and will be addressed through class weighting during model training
+
+### Principal Component Analysis of Molecular Fingerprints
+
+```{r, warning = F}
+fp_matrix <- tox21_w_fps %>%
+  select(starts_with("fp"))
+
+pca_result_fp <- prcomp(fp_matrix, scale = F)
+
+fviz_eig(pca_result_fp, addlabels = TRUE)
+```
+
+The scree plot shows no clear elbow — variance explained drops gradually from 4.1% at PC1 to 1.1% by PC10, with no dominant components emerging. This flat, diffuse structure is expected for high-dimensional binary fingerprint data, where chemical information is spread thinly across 2,048 sparse bits rather than concentrated in a few correlated features. The absence of dominant principal components motivates the use of a neural network, which can learn nonlinear combinations of fingerprint features that PCA cannot capture through linear projection alone.
+
+### PCA of Molecular Fingerprints Colored by SR.p53 Toxicity Label
+
+```{r, warning = F}
+fp.pca = PCA(fp_matrix,scale.unit = F , ncp = 6 , graph=F)
+
+fviz_pca_ind(fp.pca, 
+             geom = "point", 
+             habillage = tox21_w_fps$SR.p53,
+             alpha.ind = 0.5)
+```
+
+Toxic (1) and non-toxic (0) compounds show no meaningful separation along the first two principal components, with SR.p53-active compounds scattered throughout the same space as inactive ones. This confirms that toxicity is not linearly separable in fingerprint space, at least along the dimensions of greatest variance — further supporting the need for a nonlinear model capable of learning more complex decision boundaries.
+
+### Correlation Matrix of Toxicity Endpoints
+
+```{r, warning = F}
+endpoints %>% 
+  cor(use = "pairwise.complete.obs") %>%
+  corrplot::corrplot(method = "color")
+```
+
+Toxicity labels show modest positive correlations across endpoints, with no strong negative correlations present. The most notable pattern is the high correlation between NR.AR and NR.AR.LBD, which is expected since both assays measure androgen receptor activity — one at the full receptor level and one specifically at the ligand binding domain. NR.ER and NR.ER.LBD show a similar relationship for the same reason. These within-pathway correlations suggest shared biological mechanisms across certain endpoint pairs, which the multi-task architecture is well-suited to exploit through shared hidden layers.
+
+### Compound Toxicity Burden Across Endpoints
+
+```{r, warning = F}
+tox21_w_fps %>%
+  mutate(total_toxic = rowSums(select(., all_of(endpoint_cols)) == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = total_toxic)) +
+  geom_bar(fill = "darkred", color = "black") +
+  labs(title = "Number of Endpoints Triggered per Compound",
+       x = "Total Toxic",
+       y = "Count") +
+  theme_minimal()
+```
+
+The majority of compounds (~5,000) show no active toxicity across any endpoint, while counts drop sharply as the number of triggered endpoints increases. A small number of compounds trigger 5 or more endpoints, representing "promiscuous" toxic compounds that interfere with multiple biological pathways simultaneously. This heavy right-skew reinforces the class imbalance challenge and highlights that truly multi-endpoint toxic compounds are rare but potentially the most important to correctly identify.
+
+
+
+
+
+
+
+
+
